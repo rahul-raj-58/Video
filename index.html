@@ -1,270 +1,456 @@
-#!/usr/bin/env python3
-"""
-metabase_video_insights.py
+import React, { useState, useMemo } from 'react';
+import { LineChart, Line, BarChart, Bar, PieChart, Pie, Cell, XAxis, YAxis, CartesianGrid, Tooltip, Legend, ResponsiveContainer, ScatterChart, Scatter } from 'recharts';
 
-Pulls data from your Metabase instance and assembles a real dashboard covering:
-  - Delivery insights   (turnaround, status, SLA)
-  - Incoming video insights (volume, source, backlog)
+export default function VideoQCDashboard() {
+  const [data, setData] = useState(null);
+  const [dataInput, setDataInput] = useState('');
+  const [inputMethod, setInputMethod] = useState('paste');
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState('');
 
-Run this YOURSELF against your live Metabase instance — it needs network
-access to METABASE_BASE_URL, which this chat environment doesn't have.
+  const parseData = (jsonStr) => {
+    try {
+      const parsed = JSON.parse(jsonStr);
+      if (!Array.isArray(parsed)) throw new Error('Expected array of objects');
+      return parsed;
+    } catch (e) {
+      setError(`Parse error: ${e.message}`);
+      return null;
+    }
+  };
 
---------------------------------------------------------------------------
-SETUP
---------------------------------------------------------------------------
-1. pip install requests
+  const handleDataUpload = (e) => {
+    const file = e.target.files[0];
+    if (!file) return;
 
-2. Set your credentials as environment variables (don't hardcode the key):
+    const reader = new FileReader();
+    reader.onload = (event) => {
+      try {
+        const content = event.target.result;
+        const lines = content.trim().split('\n');
+        
+        if (lines.length < 2) {
+          setError('CSV must have headers and data');
+          return;
+        }
 
-     export METABASE_API_KEY="mb_xxx..."
-     export METABASE_BASE_URL="https://metabase.spyne.ai"
-     export METABASE_CARD_ID="12683"
+        const headers = lines[0].split(',').map(h => h.trim());
+        const rows = lines.slice(1).map(line => {
+          const values = line.split(',').map(v => v.trim());
+          const obj = {};
+          headers.forEach((h, i) => {
+            obj[h] = isNaN(values[i]) ? values[i] : parseFloat(values[i]);
+          });
+          return obj;
+        });
 
-   Optional — add more existing Metabase questions/cards to pull in,
-   grouped into the two sections of the dashboard:
+        setData(rows);
+        setError('');
+      } catch (e) {
+        setError(`CSV parse error: ${e.message}`);
+      }
+    };
+    reader.readAsText(file);
+  };
 
-     export METABASE_EXTRA_CARDS="1024:Incoming Volume by Day:incoming,1030:SLA Breaches:delivery"
+  const handlePasteJSON = () => {
+    const parsed = parseData(dataInput);
+    if (parsed) {
+      setData(parsed);
+      setError('');
+    }
+  };
 
-   Format per card: "<card_id>:<display title>:<section>"
-   <section> must be "incoming" or "delivery".
+  const fetchFromMetabase = async () => {
+    setLoading(true);
+    setError('');
+    try {
+      const response = await fetch('https://metabase.spyne.ai/api/public/card/e7deac18-d170-4080-a50a-183dd2182584/query');
+      const result = await response.json();
+      if (result.data && result.data.rows) {
+        const headers = result.data.cols.map(c => c.name);
+        const rows = result.data.rows.map(row => {
+          const obj = {};
+          headers.forEach((h, i) => {
+            obj[h] = row[i];
+          });
+          return obj;
+        });
+        setData(rows);
+      } else {
+        setError('Could not fetch data from Metabase');
+      }
+    } catch (e) {
+      setError(`Fetch error: ${e.message}`);
+    } finally {
+      setLoading(false);
+    }
+  };
 
-3. python metabase_video_insights.py
-   - Fetches each card's results
-   - Saves each as a CSV in ./exports/ (overwritten every run — always latest)
-   - Prints a quick summary (row count, columns, basic stats)
-   - Creates (or updates) a Metabase dashboard named
-     "Delivery & Incoming Video Insights" containing all the cards,
-     laid out in two labeled sections.
-   - By default this now RUNS FOREVER, re-pulling every 30 minutes.
-     Run once and exit instead with: python metabase_video_insights.py --once
-     Change the interval with: export METABASE_REFRESH_MINUTES="15"
+  const analytics = useMemo(() => {
+    if (!data) return null;
 
---------------------------------------------------------------------------
-NOTES
---------------------------------------------------------------------------
-- This script only *arranges existing questions* into a dashboard. It does
-  not invent new SQL — Metabase card 12683 is treated as your first known
-  question. To build out full "incoming videos" and "delivery" sections,
-  create a couple more saved Questions in Metabase (e.g. "Videos received
-  per day", "Avg delivery turnaround", "SLA breach count") and add their
-  IDs via METABASE_EXTRA_CARDS above.
-- Metabase API keys authenticate via the `x-api-key` header.
-- EASIER ALTERNATIVE: you don't need this script running 24/7 just to keep
-  the *dashboard view* fresh. Once the dashboard exists in Metabase, open
-  it there and click the clock/refresh icon in the top right — Metabase
-  can auto-refresh any dashboard on its own (1/5/10/15/30/60 min), pulling
-  live query results with zero extra infrastructure. Run this script once
-  (or on a schedule) mainly if you also want the CSV exports kept current,
-  or want new cards auto-added to the dashboard layout.
-"""
+    const delivered = data.filter(d => d.qc_done_time && d.v_status === 'delivered');
+    const qcDone = data.filter(d => d.qc_done_time);
+    
+    const totalVideos = data.length;
+    const deliveredCount = delivered.length;
+    const qcPassCount = qcDone.length;
+    const deliveryRate = ((deliveredCount / totalVideos) * 100).toFixed(1);
+    const passRate = ((qcPassCount / totalVideos) * 100).toFixed(1);
 
-import os
-import sys
-import csv
-import json
-import time
-from datetime import datetime
+    // Timeline analysis
+    const timeline = {};
+    data.forEach(d => {
+      const date = d.media_created_at ? new Date(d.media_created_at).toLocaleDateString() : 'unknown';
+      if (!timeline[date]) {
+        timeline[date] = { created: 0, qc_done: 0, delivered: 0 };
+      }
+      timeline[date].created++;
+      if (d.qc_done_time) timeline[date].qc_done++;
+      if (d.qc_done_time && d.v_status === 'delivered') timeline[date].delivered++;
+    });
 
-try:
-    import requests
-except ImportError:
-    sys.exit("Missing dependency. Run: pip install requests")
+    const timelineData = Object.entries(timeline).slice(-14).map(([date, counts]) => ({
+      date,
+      ...counts
+    }));
 
-BASE_URL = os.environ.get("METABASE_BASE_URL", "").rstrip("/")
-API_KEY = os.environ.get("METABASE_API_KEY", "")
-DEFAULT_CARD_ID = os.environ.get("METABASE_CARD_ID", "")
-EXTRA_CARDS_RAW = os.environ.get("METABASE_EXTRA_CARDS", "")
+    // Template analysis
+    const templateStats = {};
+    data.forEach(d => {
+      const template = d.template || 'unknown';
+      if (!templateStats[template]) {
+        templateStats[template] = { total: 0, delivered: 0, qc_done: 0 };
+      }
+      templateStats[template].total++;
+      if (d.qc_done_time) templateStats[template].qc_done++;
+      if (d.qc_done_time && d.v_status === 'delivered') templateStats[template].delivered++;
+    });
 
-DASHBOARD_NAME = "Delivery & Incoming Video Insights"
-EXPORT_DIR = "exports"
-REFRESH_MINUTES = float(os.environ.get("METABASE_REFRESH_MINUTES", "30"))
+    const templateData = Object.entries(templateStats).map(([name, stats]) => ({
+      template: name,
+      total: stats.total,
+      delivered: stats.delivered,
+      passRate: ((stats.delivered / stats.total) * 100).toFixed(1)
+    })).sort((a, b) => b.total - a.total);
 
-HEADERS = {"x-api-key": API_KEY, "Content-Type": "application/json"}
+    // View mode analysis
+    const viewModeStats = {};
+    data.forEach(d => {
+      const mode = d.view_mode || 'unknown';
+      if (!viewModeStats[mode]) {
+        viewModeStats[mode] = { total: 0, delivered: 0 };
+      }
+      viewModeStats[mode].total++;
+      if (d.qc_done_time && d.v_status === 'delivered') viewModeStats[mode].delivered++;
+    });
 
+    const viewModeData = Object.entries(viewModeStats).map(([name, stats]) => ({
+      name,
+      total: stats.total,
+      delivered: stats.delivered,
+      passRate: ((stats.delivered / stats.total) * 100).toFixed(1)
+    }));
 
-def require_config():
-    missing = []
-    if not BASE_URL:
-        missing.append("METABASE_BASE_URL")
-    if not API_KEY:
-        missing.append("METABASE_API_KEY")
-    if not DEFAULT_CARD_ID:
-        missing.append("METABASE_CARD_ID")
-    if missing:
-        sys.exit(f"Missing required env vars: {', '.join(missing)}")
+    // Status distribution
+    const statusDist = {};
+    data.forEach(d => {
+      const status = d.qc_done_time ? 'delivered' : d.v_status || 'unknown';
+      statusDist[status] = (statusDist[status] || 0) + 1;
+    });
 
+    // Processing time analysis
+    const processingTimes = data
+      .filter(d => d.media_created_at && d.qc_done_time)
+      .map(d => {
+        const created = new Date(d.media_created_at);
+        const done = new Date(d.qc_done_time);
+        const hours = (done - created) / (1000 * 60 * 60);
+        return hours;
+      });
 
-def build_card_list():
-    """Returns list of dicts: {id, title, section}"""
-    cards = [{"id": int(DEFAULT_CARD_ID), "title": "Card 12683", "section": "delivery"}]
-    if EXTRA_CARDS_RAW.strip():
-        for entry in EXTRA_CARDS_RAW.split(","):
-            entry = entry.strip()
-            if not entry:
-                continue
-            parts = entry.split(":")
-            if len(parts) != 3:
-                print(f"Skipping malformed METABASE_EXTRA_CARDS entry: {entry}")
-                continue
-            cid, title, section = parts
-            section = section.strip().lower()
-            if section not in ("incoming", "delivery"):
-                print(f"Skipping entry with invalid section '{section}': {entry}")
-                continue
-            cards.append({"id": int(cid.strip()), "title": title.strip(), "section": section})
-    return cards
+    const avgProcessingTime = (processingTimes.reduce((a, b) => a + b, 0) / processingTimes.length).toFixed(1);
 
+    return {
+      totalVideos,
+      deliveredCount,
+      qcPassCount,
+      deliveryRate,
+      passRate,
+      avgProcessingTime,
+      timelineData,
+      templateData,
+      viewModeData,
+      statusDist,
+      processingTimes
+    };
+  }, [data]);
 
-def fetch_card_data(card_id: int):
-    """Runs the saved question and returns (columns, rows) as plain python data."""
-    url = f"{BASE_URL}/api/card/{card_id}/query"
-    resp = requests.post(url, headers=HEADERS, timeout=60)
-    resp.raise_for_status()
-    payload = resp.json()
+  if (!data) {
+    return (
+      <div style={{ padding: '2rem', maxWidth: '1000px', margin: '0 auto' }}>
+        <h1 style={{ fontSize: '28px', fontWeight: '500', marginBottom: '1rem' }}>Video QC Analytics Dashboard</h1>
+        <p style={{ color: 'var(--text-secondary)', marginBottom: '2rem' }}>
+          Import your video data to view comprehensive QC and processing metrics
+        </p>
 
-    data = payload.get("data", {})
-    cols = [c.get("display_name") or c.get("name") for c in data.get("cols", [])]
-    rows = data.get("rows", [])
-    return cols, rows
+        <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(280px, 1fr))', gap: '1.5rem' }}>
+          {/* Fetch from Metabase */}
+          <div style={{ background: 'var(--surface-1)', padding: '1.5rem', borderRadius: '12px', border: '0.5px solid var(--border)' }}>
+            <h3 style={{ fontSize: '16px', fontWeight: '500', marginBottom: '1rem' }}>From Metabase</h3>
+            <p style={{ fontSize: '13px', color: 'var(--text-secondary)', marginBottom: '1rem' }}>
+              Fetch directly from your public Metabase link
+            </p>
+            <button 
+              onClick={fetchFromMetabase}
+              disabled={loading}
+              style={{
+                width: '100%',
+                padding: '10px',
+                background: 'var(--fill-accent)',
+                color: 'var(--on-accent)',
+                border: 'none',
+                borderRadius: '6px',
+                cursor: 'pointer',
+                fontSize: '14px',
+                fontWeight: '500'
+              }}
+            >
+              {loading ? 'Fetching...' : 'Fetch Data from Metabase'}
+            </button>
+          </div>
 
+          {/* Paste JSON */}
+          <div style={{ background: 'var(--surface-1)', padding: '1.5rem', borderRadius: '12px', border: '0.5px solid var(--border)' }}>
+            <h3 style={{ fontSize: '16px', fontWeight: '500', marginBottom: '1rem' }}>Paste JSON Data</h3>
+            <textarea
+              value={dataInput}
+              onChange={(e) => setDataInput(e.target.value)}
+              placeholder='[{"video_id": "123", "qc_done_time": "2024-01-01T10:00:00", ...}]'
+              style={{
+                width: '100%',
+                height: '120px',
+                padding: '10px',
+                borderRadius: '6px',
+                border: '0.5px solid var(--border)',
+                fontSize: '12px',
+                fontFamily: 'var(--font-mono)',
+                marginBottom: '1rem',
+                boxSizing: 'border-box'
+              }}
+            />
+            <button
+              onClick={handlePasteJSON}
+              style={{
+                width: '100%',
+                padding: '10px',
+                background: 'var(--fill-accent)',
+                color: 'var(--on-accent)',
+                border: 'none',
+                borderRadius: '6px',
+                cursor: 'pointer',
+                fontSize: '14px',
+                fontWeight: '500'
+              }}
+            >
+              Load JSON Data
+            </button>
+          </div>
 
-def export_csv(card_id, title, cols, rows):
-    os.makedirs(EXPORT_DIR, exist_ok=True)
-    safe_title = "".join(c if c.isalnum() or c in " _-" else "_" for c in title).strip().replace(" ", "_")
-    path = os.path.join(EXPORT_DIR, f"{card_id}_{safe_title}.csv")
-    with open(path, "w", newline="", encoding="utf-8") as f:
-        writer = csv.writer(f)
-        writer.writerow(cols)
-        writer.writerows(rows)
-    return path
+          {/* Upload CSV */}
+          <div style={{ background: 'var(--surface-1)', padding: '1.5rem', borderRadius: '12px', border: '0.5px solid var(--border)' }}>
+            <h3 style={{ fontSize: '16px', fontWeight: '500', marginBottom: '1rem' }}>Upload CSV File</h3>
+            <input
+              type="file"
+              accept=".csv"
+              onChange={handleDataUpload}
+              style={{
+                width: '100%',
+                padding: '10px',
+                borderRadius: '6px',
+                border: '0.5px solid var(--border)',
+                fontSize: '13px'
+              }}
+            />
+            <p style={{ fontSize: '12px', color: 'var(--text-muted)', marginTop: '0.5rem' }}>
+              CSV with headers: video_id, qc_done_time, v_status, etc.
+            </p>
+          </div>
+        </div>
 
+        {error && (
+          <div style={{ marginTop: '1.5rem', padding: '1rem', background: 'var(--bg-danger)', borderRadius: '6px', color: 'var(--text-danger)' }}>
+            {error}
+          </div>
+        )}
 
-def summarize(title, cols, rows):
-    print(f"\n--- {title} ---")
-    print(f"Columns: {cols}")
-    print(f"Rows: {len(rows)}")
-    if rows:
-        print(f"Sample row: {rows[0]}")
+        {/* Sample Data Section */}
+        <div style={{ marginTop: '2rem', padding: '1.5rem', background: 'var(--surface-1)', borderRadius: '12px', border: '0.5px solid var(--border)' }}>
+          <h3 style={{ fontSize: '16px', fontWeight: '500', marginBottom: '1rem' }}>Sample Data Format</h3>
+          <pre style={{ background: 'var(--surface-2)', padding: '1rem', borderRadius: '6px', fontSize: '11px', overflow: 'auto', fontFamily: 'var(--font-mono)' }}>
+{`[
+  {
+    "video_id": "vid_001",
+    "v_enterprise_id": "ent_123",
+    "template": "360 Video",
+    "view_mode": "Desktop",
+    "media_created_at": "2024-01-15T10:30:00Z",
+    "media_processed_at": "2024-01-15T14:45:00Z",
+    "sku_qc_done_time": "2024-01-15T16:30:00Z",
+    "processing_end_time": "2024-01-15T14:45:00Z",
+    "qc_done_time": "2024-01-15T16:30:00Z",
+    "v_created_on": "2024-01-15T10:30:00Z",
+    "v_status": "delivered",
+    "v_verified_status": "approved",
+    "v_crm_status": "active",
+    "apld_stage": "completed",
+    "version": "1.0",
+    "quality_check": "pass",
+    "is_hidden": false,
+    "is_360": true
+  }
+]`}
+          </pre>
+        </div>
+      </div>
+    );
+  }
 
+  const colors = {
+    delivered: '#097e3e',
+    qc_done: '#fac858',
+    processing: '#3366ff',
+    pending: '#fc8750'
+  };
 
-def get_or_create_dashboard():
-    # Check if a dashboard with this name already exists
-    resp = requests.get(f"{BASE_URL}/api/dashboard", headers=HEADERS, timeout=30)
-    resp.raise_for_status()
-    for d in resp.json():
-        if d.get("name") == DASHBOARD_NAME:
-            return d["id"]
+  return (
+    <div style={{ padding: '1.5rem', background: 'var(--surface-0)' }}>
+      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '2rem' }}>
+        <div>
+          <h1 style={{ fontSize: '28px', fontWeight: '500', margin: '0' }}>Video QC Analytics</h1>
+          <p style={{ fontSize: '13px', color: 'var(--text-secondary)', margin: '0.5rem 0 0' }}>
+            {analytics.totalVideos.toLocaleString()} videos analyzed
+          </p>
+        </div>
+        <button
+          onClick={() => setData(null)}
+          style={{
+            padding: '8px 16px',
+            background: 'var(--fill-secondary)',
+            color: 'var(--text-primary)',
+            border: '0.5px solid var(--border)',
+            borderRadius: '6px',
+            cursor: 'pointer',
+            fontSize: '13px'
+          }}
+        >
+          Load Different Data
+        </button>
+      </div>
 
-    resp = requests.post(
-        f"{BASE_URL}/api/dashboard",
-        headers=HEADERS,
-        json={"name": DASHBOARD_NAME, "description": "Auto-built: delivery + incoming video insights"},
-        timeout=30,
-    )
-    resp.raise_for_status()
-    return resp.json()["id"]
+      {/* Key Metrics */}
+      <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(140px, 1fr))', gap: '12px', marginBottom: '2rem' }}>
+        <div style={{ background: 'var(--surface-1)', padding: '1rem', borderRadius: '8px', border: '0.5px solid var(--border)' }}>
+          <p style={{ fontSize: '11px', color: 'var(--text-muted)', margin: '0 0 6px' }}>Total Videos</p>
+          <p style={{ fontSize: '22px', fontWeight: '500', margin: '0', color: 'var(--text-primary)' }}>{analytics.totalVideos}</p>
+        </div>
+        <div style={{ background: 'var(--surface-1)', padding: '1rem', borderRadius: '8px', border: '0.5px solid var(--border)' }}>
+          <p style={{ fontSize: '11px', color: 'var(--text-muted)', margin: '0 0 6px' }}>Delivered QC</p>
+          <p style={{ fontSize: '22px', fontWeight: '500', margin: '0', color: '#097e3e' }}>{analytics.deliveredCount}</p>
+          <p style={{ fontSize: '10px', color: 'var(--text-muted)', margin: '4px 0 0' }}>{analytics.deliveryRate}%</p>
+        </div>
+        <div style={{ background: 'var(--surface-1)', padding: '1rem', borderRadius: '8px', border: '0.5px solid var(--border)' }}>
+          <p style={{ fontSize: '11px', color: 'var(--text-muted)', margin: '0 0 6px' }}>QC Pass Rate</p>
+          <p style={{ fontSize: '22px', fontWeight: '500', margin: '0', color: '#3366ff' }}>{analytics.passRate}%</p>
+          <p style={{ fontSize: '10px', color: 'var(--text-muted)', margin: '4px 0 0' }}>({analytics.qcPassCount} videos)</p>
+        </div>
+        <div style={{ background: 'var(--surface-1)', padding: '1rem', borderRadius: '8px', border: '0.5px solid var(--border)' }}>
+          <p style={{ fontSize: '11px', color: 'var(--text-muted)', margin: '0 0 6px' }}>Avg Processing</p>
+          <p style={{ fontSize: '22px', fontWeight: '500', margin: '0', color: 'var(--text-primary)' }}>{analytics.avgProcessingTime}h</p>
+        </div>
+      </div>
 
+      {/* Charts */}
+      <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(320px, 1fr))', gap: '1.5rem', marginBottom: '2rem' }}>
+        {/* Timeline Chart */}
+        <div style={{ background: 'var(--surface-1)', padding: '1.25rem', borderRadius: '12px', border: '0.5px solid var(--border)' }}>
+          <h3 style={{ fontSize: '14px', fontWeight: '500', margin: '0 0 1rem' }}>Processing Timeline</h3>
+          <ResponsiveContainer width="100%" height={250}>
+            <LineChart data={analytics.timelineData} margin={{ top: 5, right: 10, left: -25, bottom: 5 }}>
+              <CartesianGrid strokeDasharray="3 3" stroke="var(--border)" vertical={false} />
+              <XAxis dataKey="date" stroke="var(--text-muted)" style={{ fontSize: '11px' }} />
+              <YAxis stroke="var(--text-muted)" style={{ fontSize: '11px' }} />
+              <Tooltip contentStyle={{ background: 'var(--surface-2)', border: '0.5px solid var(--border)' }} />
+              <Legend wrapperStyle={{ fontSize: '11px' }} />
+              <Line type="monotone" dataKey="delivered" stroke={colors.delivered} strokeWidth={2} dot={{ r: 3 }} name="Delivered" />
+              <Line type="monotone" dataKey="qc_done" stroke={colors.qc_done} strokeWidth={2} dot={{ r: 3 }} name="QC Done" />
+              <Line type="monotone" dataKey="created" stroke={colors.processing} strokeWidth={2} dot={{ r: 3 }} name="Created" />
+            </LineChart>
+          </ResponsiveContainer>
+        </div>
 
-def assemble_dashboard(dashboard_id, cards):
-    """Lays out a heading + cards for each section, stacked vertically."""
-    dashcards = []
-    row_cursor = 0
-    section_order = ["incoming", "delivery"]
-    grouped = {s: [c for c in cards if c["section"] == s] for s in section_order}
+        {/* Status Distribution */}
+        <div style={{ background: 'var(--surface-1)', padding: '1.25rem', borderRadius: '12px', border: '0.5px solid var(--border)' }}>
+          <h3 style={{ fontSize: '14px', fontWeight: '500', margin: '0 0 1rem' }}>Status Distribution</h3>
+          <ResponsiveContainer width="100%" height={250}>
+            <PieChart>
+              <Pie data={Object.entries(analytics.statusDist).map(([name, value]) => ({ name, value }))} cx="50%" cy="50%" innerRadius={50} outerRadius={70} paddingAngle={2} dataKey="value">
+                {['#097e3e', '#fac858', '#3366ff', '#fc8750', '#dd4a4a'].map((color, i) => <Cell key={i} fill={color} />)}
+              </Pie>
+              <Tooltip />
+            </PieChart>
+          </ResponsiveContainer>
+        </div>
+      </div>
 
-    for section in section_order:
-        section_cards = grouped[section]
-        if not section_cards:
-            continue
+      {/* Template Performance */}
+      <div style={{ background: 'var(--surface-1)', padding: '1.25rem', borderRadius: '12px', border: '0.5px solid var(--border)', marginBottom: '1.5rem' }}>
+        <h3 style={{ fontSize: '14px', fontWeight: '500', margin: '0 0 1rem' }}>Template Performance</h3>
+        <div style={{ overflowX: 'auto' }}>
+          <table style={{ width: '100%', fontSize: '12px', borderCollapse: 'collapse' }}>
+            <thead>
+              <tr style={{ borderBottom: '0.5px solid var(--border)' }}>
+                <th style={{ textAlign: 'left', padding: '8px', color: 'var(--text-secondary)' }}>Template</th>
+                <th style={{ textAlign: 'right', padding: '8px', color: 'var(--text-secondary)' }}>Total</th>
+                <th style={{ textAlign: 'right', padding: '8px', color: 'var(--text-secondary)' }}>Delivered</th>
+                <th style={{ textAlign: 'right', padding: '8px', color: 'var(--text-secondary)' }}>Pass Rate</th>
+              </tr>
+            </thead>
+            <tbody>
+              {analytics.templateData.map((row, i) => (
+                <tr key={i} style={{ borderBottom: '0.5px solid var(--border)' }}>
+                  <td style={{ padding: '8px', color: 'var(--text-primary)' }}>{row.template}</td>
+                  <td style={{ textAlign: 'right', padding: '8px', color: 'var(--text-secondary)' }}>{row.total}</td>
+                  <td style={{ textAlign: 'right', padding: '8px', color: 'var(--text-secondary)' }}>{row.delivered}</td>
+                  <td style={{ textAlign: 'right', padding: '8px', fontWeight: '500', color: '#097e3e' }}>{row.passRate}%</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      </div>
 
-        heading_text = "📥 Incoming Videos" if section == "incoming" else "🚚 Delivery"
-        dashcards.append({
-            "id": -(len(dashcards) + 1),
-            "card_id": None,
-            "row": row_cursor,
-            "col": 0,
-            "size_x": 24,
-            "size_y": 2,
-            "visualization_settings": {
-                "virtual_card": {"display": "heading"},
-                "text": f"## {heading_text}",
-            },
-        })
-        row_cursor += 2
-
-        col_cursor = 0
-        for c in section_cards:
-            dashcards.append({
-                "id": -(len(dashcards) + 1),
-                "card_id": c["id"],
-                "row": row_cursor,
-                "col": col_cursor,
-                "size_x": 12,
-                "size_y": 8,
-            })
-            col_cursor += 12
-            if col_cursor >= 24:
-                col_cursor = 0
-                row_cursor += 8
-        row_cursor += 9
-
-    resp = requests.put(
-        f"{BASE_URL}/api/dashboard/{dashboard_id}",
-        headers=HEADERS,
-        json={"dashcards": dashcards},
-        timeout=30,
-    )
-    resp.raise_for_status()
-    return resp.json()
-
-
-def run_once(cards):
-    """Fetch fresh data for every card, re-export CSVs, and rebuild the dashboard."""
-    print(f"\n[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] Refreshing {len(cards)} card(s): {[c['title'] for c in cards]}")
-
-    for c in cards:
-        try:
-            cols, rows = fetch_card_data(c["id"])
-        except requests.HTTPError as e:
-            print(f"Failed to fetch card {c['id']} ({c['title']}): {e}")
-            continue
-        summarize(c["title"], cols, rows)
-        path = export_csv(c["id"], c["title"], cols, rows)
-        print(f"Saved -> {path}")
-
-    try:
-        dashboard_id = get_or_create_dashboard()
-        assemble_dashboard(dashboard_id, cards)
-        print(f"Dashboard updated: {BASE_URL}/dashboard/{dashboard_id}")
-    except requests.HTTPError as e:
-        print(f"Could not create/update dashboard automatically: {e}")
-        print("Your CSV exports in ./exports/ are still available.")
-
-
-def main():
-    require_config()
-    cards = build_card_list()
-    run_once_only = "--once" in sys.argv
-
-    run_once(cards)
-
-    if run_once_only:
-        return
-
-    print(f"\nEntering refresh loop — pulling live data every {REFRESH_MINUTES:g} minutes.")
-    print("Press Ctrl+C to stop. Use --once to run a single pull instead.")
-
-    while True:
-        try:
-            time.sleep(REFRESH_MINUTES * 60)
-            run_once(cards)
-        except KeyboardInterrupt:
-            print("\nStopped.")
-            break
-        except requests.RequestException as e:
-            # Network hiccup — don't die, just wait for the next cycle.
-            print(f"Refresh failed ({e}); will retry next cycle.")
-
-
-if __name__ == "__main__":
-    main()
+      {/* View Mode Analysis */}
+      <div style={{ background: 'var(--surface-1)', padding: '1.25rem', borderRadius: '12px', border: '0.5px solid var(--border)' }}>
+        <h3 style={{ fontSize: '14px', fontWeight: '500', margin: '0 0 1rem' }}>View Mode Analysis</h3>
+        <div style={{ display: 'grid', gap: '12px' }}>
+          {analytics.viewModeData.map((vm, i) => (
+            <div key={i}>
+              <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: '6px' }}>
+                <span style={{ fontSize: '12px', fontWeight: '500' }}>{vm.name}</span>
+                <span style={{ fontSize: '12px', color: 'var(--text-secondary)' }}{vm.passRate}%</span>
+              </div>
+              <div style={{ display: 'flex', gap: '8px', alignItems: 'center' }}>
+                <div style={{ flex: 1, height: '6px', background: 'var(--surface-2)', borderRadius: '3px' }}>
+                  <div style={{ height: '100%', background: '#3366ff', width: vm.passRate + '%', borderRadius: '3px' }} />
+                </div>
+                <span style={{ fontSize: '11px', color: 'var(--text-muted)', minWidth: '50px' }}>{vm.delivered}/{vm.total}</span>
+              </div>
+            </div>
+          ))}
+        </div>
+      </div>
+    </div>
+  );
+}
